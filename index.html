@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>股票熱力圖（可上傳 / 可分享）</title>
+
+  <!-- Plotly Treemap -->
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+  <!-- CSV parser -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <!-- Excel parser -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <!-- URL-friendly compression -->
+  <script src="https://cdn.jsdelivr.net/npm/lz-string@1.5.0/libs/lz-string.min.js"></script>
+
+  <style>
+    :root { --border:#e5e7eb; --muted:#6b7280; }
+    body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans TC", sans-serif; }
+    header { padding: 14px 16px; border-bottom: 1px solid var(--border); }
+    h1 { margin: 0; font-size: 18px; }
+    .muted { color: var(--muted); font-size: 13px; margin-top: 6px; line-height: 1.5; }
+    .bar { display:flex; gap:10px; flex-wrap: wrap; padding: 12px 16px; border-bottom: 1px solid var(--border); align-items: center; }
+    button { padding: 8px 10px; border: 1px solid var(--border); background: #fff; border-radius: 10px; cursor:pointer; }
+    button:hover { background:#f9fafb; }
+    input[type="file"] { padding: 6px 0; }
+    input[type="text"] { padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; min-width: 280px; }
+    #msg { padding: 0 16px 10px; color: #b91c1c; font-size: 13px; min-height: 18px; }
+    #chart { height: calc(100vh - 140px); }
+    .ok { color: #047857 !important; }
+    .drop {
+      margin: 10px 16px 0;
+      border: 2px dashed var(--border);
+      border-radius: 14px;
+      padding: 10px 12px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+  </style>
+</head>
+
+<body>
+  <header>
+    <h1>股票熱力圖（上傳資料 → 產生分享連結）</h1>
+    <div class="muted">
+      預設會嘗試讀取同資料夾的 <b>data.csv</b>。你也可以拖拉/選檔上傳 CSV/XLSX/JSON。
+      「產生分享連結」會把資料壓縮後放進網址 #hash，分享給別人即可看到同一張圖。
+    </div>
+  </header>
+
+  <div class="bar">
+    <input id="file" type="file" accept=".csv,.xlsx,.xls,.json" />
+    <button id="btnLoadDefault">載入（或重載）data.csv</button>
+    <button id="btnShare">產生分享連結</button>
+    <button id="btnCopy" disabled>複製分享連結</button>
+    <span class="muted">或從網址載入 CSV：</span>
+    <input id="csvUrl" type="text" placeholder="貼上 data.csv 的公開網址（raw）" />
+    <button id="btnLoadUrl">從網址載入</button>
+  </div>
+
+  <div class="drop">📥 你也可以把檔案直接拖曳到這個頁面任何位置放開（CSV / XLSX / JSON）。</div>
+  <div id="msg"></div>
+  <div id="chart"></div>
+
+<script>
+  const $msg = document.getElementById('msg');
+  const $file = document.getElementById('file');
+  const $btnLoadDefault = document.getElementById('btnLoadDefault');
+  const $btnShare = document.getElementById('btnShare');
+  const $btnCopy = document.getElementById('btnCopy');
+  const $csvUrl = document.getElementById('csvUrl');
+  const $btnLoadUrl = document.getElementById('btnLoadUrl');
+
+  let lastRows = null;
+
+  function setMsg(text, ok=false) {
+    $msg.textContent = text || '';
+    $msg.className = ok ? 'ok' : '';
+  }
+
+  function toNumber(x) {
+    if (x === null || x === undefined) return NaN;
+    if (typeof x === 'number') return x;
+    const s = String(x).trim().replace('%','');
+    const n = Number(s);
+    return Number.isFinite(n) ? n : NaN;
+  }
+
+  function pickColumn(headers, candidates) {
+    const lower = headers.map(h => String(h).trim().toLowerCase());
+    for (const c of candidates) {
+      const idx = lower.indexOf(String(c).toLowerCase());
+      if (idx >= 0) return headers[idx];
+    }
+    return null;
+  }
+
+  function normalizeRows(rawRows) {
+    if (!Array.isArray(rawRows) || rawRows.length === 0) throw new Error('沒有讀到任何資料列。');
+
+    const headers = Object.keys(rawRows[0] || {});
+    if (headers.length === 0) throw new Error('找不到欄位（header）。');
+
+    const colGroup  = pickColumn(headers, ['group','sector','industry','分類','產業','類別']);
+    const colSymbol = pickColumn(headers, ['symbol','ticker','code','代碼','股票','stock','name']);
+    const colValue  = pickColumn(headers, ['value','size','market_cap','marketcap','weight','市值','權重','成交金額','amount']);
+    const colChange = pickColumn(headers, ['change','chg','return','pct','perf','漲跌','漲跌幅','報酬','報酬率']);
+
+    if (!colSymbol) throw new Error('找不到「symbol」欄位（可接受：symbol/ticker/code/代碼/股票）。');
+    if (!colChange) throw new Error('找不到「change」欄位（可接受：change/return/pct/漲跌幅）。');
+
+    const rows = rawRows.map((r) => {
+      const group = colGroup ? String(r[colGroup] ?? '未分類').trim() : '未分類';
+      const symbol = String(r[colSymbol] ?? '').trim();
+      const value = colValue ? toNumber(r[colValue]) : 1;
+      const change = toNumber(r[colChange]);
+
+      if (!symbol) return null;
+      return {
+        group,
+        symbol,
+        value: Number.isFinite(value) && value > 0 ? value : 1,
+        change: Number.isFinite(change) ? change : 0
+      };
+    }).filter(Boolean);
+
+    if (rows.length === 0) throw new Error('資料列解析後為空（可能 symbol 欄位都是空的）。');
+    return rows;
+  }
+
+  function buildTreemap(rows) {
+    const groupMap = new Map();
+    for (const r of rows) {
+      if (!groupMap.has(r.group)) groupMap.set(r.group, {value:0, wchg:0});
+      const g = groupMap.get(r.group);
+      g.value += r.value;
+      g.wchg += r.change * r.value;
+    }
+
+    const labels = ['全部'];
+    const parents = [''];
+    const values = [0];
+    const colors = [0];
+
+    for (const [gname, g] of groupMap.entries()) {
+      labels.push(gname);
+      parents.push('全部');
+      values.push(g.value);
+      colors.push(g.value ? (g.wchg / g.value) : 0);
+    }
+
+    for (const r of rows) {
+      labels.push(r.symbol);
+      parents.push(r.group);
+      values.push(r.value);
+      colors.push(r.change);
+    }
+
+    values[0] = Array.from(groupMap.values()).reduce((s,x)=>s+x.value,0);
+    return {labels, parents, values, colors};
+  }
+
+  function render(rows) {
+    const {labels, parents, values, colors} = buildTreemap(rows);
+    lastRows = rows;
+
+    const data = [{
+      type: 'treemap',
+      labels,
+      parents,
+      values,
+      branchvalues: 'total',
+      marker: {
+        colors,
+        colorscale: 'RdYlGn',
+        cmid: 0,
+        line: { width: 1, color: '#ffffff' }
+      },
+      hovertemplate:
+        '<b>%{label}</b><br>' +
+        '分類：%{parent}<br>' +
+        '大小：%{value}<br>' +
+        '變動：%{color:.2f}<extra></extra>'
+    }];
+
+    Plotly.newPlot('chart', data, {margin:{l:10,r:10,t:10,b:10}}, {responsive:true, displaylogo:false});
+    setMsg('已更新熱力圖。', true);
+    $btnCopy.disabled = true;
+  }
+
+  function loadCSVText(text) {
+    const parsed = Papa.parse(text, {header: true, skipEmptyLines: true});
+    if (parsed.errors && parsed.errors.length) {
+      throw new Error('CSV 解析錯誤：' + parsed.errors[0].message);
+    }
+    return parsed.data;
+  }
+
+  async function handleFile(file) {
+    setMsg('');
+    const name = (file.name || '').toLowerCase();
+    const buf = await file.arrayBuffer();
+
+    if (name.endsWith('.csv')) {
+      const text = new TextDecoder('utf-8').decode(buf);
+      render(normalizeRows(loadCSVText(text)));
+      return;
+    }
+    if (name.endsWith('.json')) {
+      const text = new TextDecoder('utf-8').decode(buf);
+      const raw = JSON.parse(text);
+      const rawRows = Array.isArray(raw) ? raw : (raw.rows || raw.data || []);
+      render(normalizeRows(rawRows));
+      return;
+    }
+    if (name.endsWith('.xlsx') || name.endsWith('.xls')) {
+      const wb = XLSX.read(buf, {type: 'array'});
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const rawRows = XLSX.utils.sheet_to_json(sheet, {defval: ''});
+      render(normalizeRows(rawRows));
+      return;
+    }
+    throw new Error('不支援的檔案格式。請用 CSV / XLSX / JSON。');
+  }
+
+  function makeShareLink(rows) {
+    const payload = {v: 1, rows};
+    const json = JSON.stringify(payload);
+    const compressed = LZString.compressToEncodedURIComponent(json);
+    return `${location.origin}${location.pathname}#data=${compressed}`;
+  }
+
+  function tryLoadFromHash() {
+    const hash = location.hash || '';
+    if (!hash.startsWith('#data=')) return false;
+    try {
+      const encoded = hash.slice(6);
+      const json = LZString.decompressFromEncodedURIComponent(encoded);
+      const payload = JSON.parse(json);
+      if (!payload || !Array.isArray(payload.rows)) throw new Error('hash 內容不正確');
+      render(payload.rows);
+      setMsg('已從分享連結載入資料。', true);
+      return true;
+    } catch (e) {
+      setMsg('分享連結解析失敗：' + (e?.message || e));
+      return false;
+    }
+  }
+
+  async function loadFromUrl(url) {
+    setMsg('');
+    if (!url) throw new Error('請貼上 CSV 的公開網址。');
+    const res = await fetch(url, {cache: 'no-store'});
+    if (!res.ok) throw new Error(`抓取失敗：HTTP ${res.status}`);
+    const text = await res.text();
+    render(normalizeRows(loadCSVText(text)));
+  }
+
+  async function loadDefaultCSV() {
+    try {
+      // 在 GitHub Pages 會成功；在本機 file:// 可能被瀏覽器限制而失敗（正常）
+      const res = await fetch('./data.csv', {cache: 'no-store'});
+      if (!res.ok) throw new Error(`抓取 data.csv 失敗：HTTP ${res.status}`);
+      const text = await res.text();
+      render(normalizeRows(loadCSVText(text)));
+      setMsg('已載入 data.csv。', true);
+    } catch (e) {
+      setMsg('載入 data.csv 失敗（本機 file:// 常見限制，部署到 Pages 就正常）：' + (e?.message || e));
+    }
+  }
+
+  // events
+  $file.addEventListener('change', async (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    try { await handleFile(f); }
+    catch (err) { setMsg(err?.message || String(err)); }
+  });
+
+  // drag & drop
+  window.addEventListener('dragover', (e) => { e.preventDefault(); });
+  window.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    const f = e.dataTransfer?.files?.[0];
+    if (!f) return;
+    try { await handleFile(f); }
+    catch (err) { setMsg(err?.message || String(err)); }
+  });
+
+  $btnLoadDefault.addEventListener('click', loadDefaultCSV);
+
+  document.getElementById('btnShare').addEventListener('click', () => {
+    try {
+      if (!lastRows) throw new Error('請先上傳資料或成功載入 data.csv。');
+      const url = makeShareLink(lastRows);
+      location.hash = url.split('#')[1];
+      setMsg('已產生分享連結（資料已寫入網址 #hash）。可按「複製分享連結」。', true);
+      $btnCopy.disabled = false;
+    } catch (err) {
+      setMsg(err?.message || String(err));
+    }
+  });
+
+  $btnCopy.addEventListener('click', async () => {
+    try {
+      const url = `${location.origin}${location.pathname}${location.hash}`;
+      await navigator.clipboard.writeText(url);
+      setMsg('已複製到剪貼簿。', true);
+    } catch (err) {
+      setMsg('複製失敗：你可以直接手動複製網址列。');
+    }
+  });
+
+  $btnLoadUrl.addEventListener('click', async () => {
+    try { await loadFromUrl($csvUrl.value.trim()); }
+    catch (err) { setMsg(err?.message || String(err)); }
+  });
+
+  // boot
+  if (!tryLoadFromHash()) {
+    loadDefaultCSV();
+  }
+</script>
+</body>
+</html>
